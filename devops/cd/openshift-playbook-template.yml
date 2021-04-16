@@ -1,0 +1,125 @@
+- hosts: targetserver
+  remote_user: ibmadmin
+  vars_files:
+    - external_vars.yml
+  vars:
+    APP_NAME: "{{ API_NAME }}"
+    REGISTRY_URL: "{{ REGISTRY_HOST_AND_PORT }}"
+    IMAGE_TAG: "{{ IMAGE_TAG }}"
+    IMAGE_NAME: "{{ API_NAME }}"
+    PROJECT_NAME: "{{ PROJECT_NAME }}"
+    OPENSHIFT_SERVER: "{{ OPENSHIFT_SERVER }}"
+    OPENSHIFT_TOKEN: "{{ OPENSHIFT_TOKEN }}"
+    foldername: "{{ FOLDER_NAME }}"
+    IC_REG_URL: "{{ IC_REG_URL }}"
+    IC_REG_NAME: "{{ IC_REG_NAME }}"
+    dynamicPortUpdateURL: "{{ DYNAMIC_PORT_UPDATEA_URL }}"
+    runId: "{{ RUNID }}"
+    implementationType: "{{ IMPLEMENTATION_TYPE }}"
+
+  tasks:
+    - name: debug APP_NAME
+      debug:
+        var: APP_NAME
+    - name: debug REGISTRY_URL
+      debug:
+        var: REGISTRY_URL
+    - name: debug IMAGE_TAG
+      debug:
+        var: IMAGE_TAG
+    - name: debug PROJECT_NAME
+      debug:
+        var: PROJECT_NAME
+    - name: OPENSHIFT_SERVER
+      debug:
+        var: OPENSHIFT_SERVER
+    - name: IMAGE_NAME
+      debug:
+        var: IMAGE_NAME
+    - name: dynamicPortUpdateURL
+      debug:
+        var: dynamicPortUpdateURL
+    - name: implementationType
+      debug:
+        var: implementationType
+        
+    - name: Creates directory
+      file:
+        path: /home/ibmadmin/ansibleDirTarget/{{ foldername }}
+        state: directory 
+
+    - name: Copying Template file to target machine
+      copy: src=/home/ibmadmin/ansibleDir/{{ foldername }}/{{ item }} dest=/home/ibmadmin/ansibleDirTarget/{{ foldername }}/
+      with_items:
+        - deploymentConfigTemplate.yaml
+        - imageStreamTemplate.yaml
+        - routeTemplate.yaml
+        - servicesTemplate.yaml  
+        - docker.env   
+      
+    - name: Image Pull from Container Registry
+      shell: 'docker pull {{ REGISTRY_URL }}/{{ IMAGE_NAME }}:{{ IMAGE_TAG }}'
+      ignore_errors: True    
+
+    - name: Image Tag as per Openshift
+      shell: 'docker tag {{ REGISTRY_URL }}/{{ IMAGE_NAME }}:{{ IMAGE_TAG }} {{ IC_REG_URL }}/{{ IC_REG_NAME }}/{{ APP_NAME }}:{{ IMAGE_TAG }}'
+      ignore_errors: True
+
+    - name: Image Push to IBM Cloud registry
+      shell: 'docker push {{ IC_REG_URL }}/{{ IC_REG_NAME }}/{{ APP_NAME }}:{{ IMAGE_TAG }}'
+      ignore_errors: True
+      
+    - name: OpenShift CLI login
+      shell: 'oc login --token {{ OPENSHIFT_TOKEN }} -s={{ OPENSHIFT_SERVER }} -n {{ PROJECT_NAME }}'
+      register: osclilogin
+      ignore_errors: True
+    
+    - name: Image Stream Creation on Openshift
+      shell: 'oc new-app -f /home/ibmadmin/ansibleDirTarget/{{ foldername }}/imageStreamTemplate.yaml -p IMAGE_STREAM_NAME={{ APP_NAME }}'
+      ignore_errors: True   
+      
+    - name: Import IBM Cloud Registry Image to Openshift Internal Registry
+      shell: 'oc import-image {{ APP_NAME }}:{{ IMAGE_TAG }} --from={{ IC_REG_URL }}/{{ IC_REG_NAME }}/{{ APP_NAME }}:{{ IMAGE_TAG }} --confirm'
+      ignore_errors: True   
+      
+    - name: Image Tag is setting to Latest
+      shell: 'oc tag {{ APP_NAME }}:{{ IMAGE_TAG }} {{ APP_NAME }}:latest'
+      ignore_errors: True
+      
+    - name: Create and Run Deployment Config
+      shell: 'oc new-app -f /home/ibmadmin/ansibleDirTarget/{{ foldername }}/deploymentConfigTemplate.yaml --env-file=/home/ibmadmin/ansibleDirTarget/{{ foldername }}/docker.env -p APP_NAME={{ APP_NAME }} -p PROJECT_NAME={{ PROJECT_NAME }} -p IMAGE_STREAM_NAME={{ IMAGE_NAME }} -p IMAGE_STREAM_TAG=latest'
+      ignore_errors: True            
+
+    - name: Create Service
+      shell: 'oc new-app -f /home/ibmadmin/ansibleDirTarget/{{ foldername }}/servicesTemplate.yaml -p APP_NAME={{ APP_NAME }}'
+      ignore_errors: True 
+
+    - name: Create Route
+      shell: 'oc new-app -f /home/ibmadmin/ansibleDirTarget/{{ foldername }}/routeTemplate.yaml -p APP_NAME={{ APP_NAME }} -p PROJECT_NAME={{ PROJECT_NAME }}'
+      ignore_errors: True 
+
+    - name: Get the Route and post to RunManagement
+      shell: 'oc get route {{ APP_NAME }} -o=jsonpath={.spec.host}'
+      register: routeName
+      ignore_errors: True 
+      
+    - name: routeName
+      debug:
+        var: routeName.stdout
+      
+    - name: Updating Route on which container deployed to run management endpoint or springboot
+      uri:
+        url: http://{{ dynamicPortUpdateURL }}/ports
+        method: PUT
+        body_format: form-urlencoded
+        body:
+          httpsPort: "{{ routeName.stdout }}"
+          httpPort: "{{ routeName.stdout }}"
+          runId: "{{ runId }}"
+      register: postToRunID
+      when: implementationType == "springboot"
+
+    - name: Debug status of update route to runid
+      debug:
+        var: postToRunID
+      when: implementationType == "springboot"     

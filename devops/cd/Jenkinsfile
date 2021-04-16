@@ -1,0 +1,219 @@
+def  readconfigfile='', configserveruri='';
+def appDeployProcess;
+def props;
+def propsvault;
+node {
+
+    stage('Pulling deployment details') {
+        
+            try {
+                checkout scm
+                props = readProperties file: """devops/deploy.properties"""
+                
+                //Overriding the properties if available in parameter for higher environments
+                props['configserveruri'] = "${configServerUrl}" ?: props['configserveruri']
+                echo "Using " + props['configserveruri'] + " Config server url."
+                props['deploy.defaultEnvironment'] = "${profile}" ?: props['deploy.defaultEnvironment']
+                echo "Using \"" + props['deploy.defaultEnvironment'] + "\" profile."
+                props['api.version'] = "${version}" ?: props['api.version']
+                echo "Using \"" + props['api.version'] + "\" docker version."
+
+                
+            }
+            catch (e) {
+                currentBuild.result = 'FAILURE'
+                sh """rm -rf  credential.properties vault.json"""
+                echo """${e.getMessage()}"""
+                throw e
+            }
+            catch (error) {
+                currentBuild.result = 'FAILURE'
+                sh """rm -rf  credential.properties vault.json"""
+                echo """${error.getMessage()}"""
+                throw error
+            }
+       
+    }
+
+
+    stage('Deploy to Openshift ansible') {
+        try {
+            if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+                println "Deployment tool selected is  -> " + 'ANSIBLE'
+                println " Node name " + """${NODE_NAME}"""
+                println " Node name " + """${BUILD_TAG}"""
+                def openshiftSecrets = [
+                        [path: "environments/${props['deploy.defaultEnvironment']}", engineVersion: 2, secretValues: [
+                                [vaultKey: 'openshiftServer'], [vaultKey: 'openshiftToken'], [vaultKey: 'icRegUrl'], [vaultKey: 'icRegName'], [vaultKey: 'openshiftProjectName'], [vaultKey: 'server.kafka.url', envVar: 'serverKafkaUrl'], [vaultKey: 'targetVmPassword'], [vaultKey: 'targetVmUsername'], [vaultKey: 'targetEnvironmentURL'],,[vaultKey: 'server.mongodb.uri', envVar: 'mongoDBURL']]]
+                ]
+                withVault([vaultSecrets: openshiftSecrets]) {
+                    sh """
+                            sed -i "s|configserveruri|${props['configserveruri']}|g"  devops/cd/docker.env
+                            sed -i "s|environmentprofile|${props['deploy.defaultEnvironment']}|g"  devops/cd/docker.env
+                            sed -i "s|bootstrapserver|${serverKafkaUrl}|g"  devops/cd/docker.env
+                            echo server.mongodb.uri=${mongoDBURL} >> devops/cd/docker.env
+                    """
+                }
+                def tempFolderName = """${BUILD_TAG}"""
+                println " tempFolderName " + """${tempFolderName}"""
+                sh """
+                        echo --- > external_vars.yml
+
+                        echo API_NAME: ${props['deploy.app']} >> external_vars.yml
+                        echo IMAGE_TAG: ${props['api.version']} >> external_vars.yml
+                        echo PORT_TO_DEPLOY_CONTAINER: ${props['app.port']} >> external_vars.yml
+                        echo FOLDER_NAME: ${tempFolderName} >> external_vars.yml
+                        echo RUNID: ${props['run.id']} >> external_vars.yml
+                        echo IMPLEMENTATION_TYPE: ${props['api.implementation.type']} >> external_vars.yml
+                        echo PORT_TO_DEPLOY_CONTAINER_MICRO: ${props['app.httpsport']} >> external_vars.yml
+                """
+
+                withVault([vaultSecrets: openshiftSecrets]) {
+                    sh """
+                            echo OPENSHIFT_SERVER: ${openshiftServer} >> external_vars.yml
+                            echo OPENSHIFT_TOKEN: ${openshiftToken} >> external_vars.yml
+                            echo IC_REG_URL: ${icRegUrl} >> external_vars.yml
+                            echo IC_REG_NAME: ${icRegName} >> external_vars.yml
+                            echo PROJECT_NAME: ${openshiftProjectName} >> external_vars.yml
+                            echo TARGET_SERVER_IP: ${targetEnvironmentURL} >> external_vars.yml
+                            echo TARGET_SERVER_PASSWORD: ${targetVmPassword} >> external_vars.yml
+                            echo TARGET_SERVER_USER: ${targetVmUsername} >> external_vars.yml
+                    """
+                }
+                def commonSecrets = [
+                        [path: 'environments/common', engineVersion: 2, secretValues: [
+                                [vaultKey: 'ansibleIP'], [vaultKey: 'ansiblePassword'], [vaultKey: 'ansibleUsername'], [vaultKey: 'nexusRegistryUrl']]]
+                ]
+                withVault([vaultSecrets: commonSecrets]) {
+                    sh """
+                            echo REGISTRY_HOST_AND_PORT: ${nexusRegistryUrl} >> external_vars.yml
+                            echo DYNAMIC_PORT_UPDATEA_URL: ${props['runManagementIP']} >> external_vars.yml
+                            sshpass -p ${ansiblePassword} ssh -o StrictHostKeyChecking=no ${ansibleUsername}@${ansibleIP} mkdir /home/ibmadmin/ansibleDir/${tempFolderName}
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/openshift-playbook-template.yml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/playbook.yml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/inventory.py ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp external_vars.yml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/external_vars.yml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/docker.env ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/docker.env >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/deploymentConfigTemplate.yaml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/deploymentConfigTemplate.yaml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/imageStreamTemplate.yaml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/imageStreamTemplate.yaml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/routeTemplate.yaml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/routeTemplate.yaml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} scp devops/cd/servicesTemplate.yaml ${ansibleUsername}@${ansibleIP}:/home/ibmadmin/ansibleDir/${tempFolderName}/servicesTemplate.yaml >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} ssh ${ansibleUsername}@${ansibleIP} chmod 0777 /home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py >> executeDeploymentWithAnsible.sh
+                            echo sshpass -p ${ansiblePassword} ssh ${ansibleUsername}@${ansibleIP} ansible-playbook -i /home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py /home/ibmadmin/ansibleDir/${tempFolderName}/playbook.yml >> executeDeploymentWithAnsible.sh
+                            chmod +x executeDeploymentWithAnsible.sh
+                            ./executeDeploymentWithAnsible.sh
+                    """
+                }
+            }
+        }
+        catch (e) {
+            currentBuild.result = 'FAILURE'
+            throw e
+        }
+        finally {
+            sh """rm -rf devops/cd/docker-compose.yml"""
+        }
+    }
+
+
+    stage('Validate Microservice Deployment') {
+        try {
+            if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+                echo "Checking Microservices status"
+                //Add your helth check here
+            }
+        }
+        catch (e) {
+            currentBuild.result = 'FAILURE'
+            echo """${e.getMessage()}"""
+            sh """rm -rf  credential.properties vault.json"""
+            throw e
+        }
+        catch (error) {
+            currentBuild.result = 'UNSTABLE'
+            echo """${error.getMessage()}"""
+            sh """rm -rf  credential.properties vault.json"""
+        }
+    }
+
+    stage('Prometheus Target post') {
+        try {
+            if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+    
+                // Get ports where the application is deployed
+                def runid = props['run.id']
+                def endpoints = """${props['runManagementIP']}"""
+               
+                sh """curl  http://$endpoints/ports?runId=$runid >sample.json"""
+                def json = readJSON file: 'sample.json'
+                httpport = json.http
+                def targetvalue = ''
+                targetvalue = httpport
+                def filename = props['deploy.app'] + ".yaml"
+                def filename_https = props['deploy.app'] + "-Https" + ".yaml"
+                writeFile file: filename, text: 'xyz'
+                if (json.https) {
+                    def httpsport = json.https
+                    def targetvaluehttps = ''
+    
+                    targetvaluehttps = httpsport
+                    writeFile file: filename_https, text: 'xyz'
+                    sh """cp -r  /mnt/dipNFSsharedClient/prometheus-development/TargetTemplate2.0.json $filename_https"""
+    
+                    def targetjson = readYaml file: """$filename_https"""
+                    def target = targetjson[0].targets
+                    targetjson[0].labels.application = props['deploy.app']
+                    targetjson[0].labels.__metrics_path__ = "/actuator/prometheus"
+                    target.add(targetvaluehttps)
+                    fileOperations([fileDeleteOperation(excludes: '', includes: filename_https)])
+                    writeYaml file: filename_https, data: targetjson
+                    sh """sudo cp -r $filename_https /mnt/dipNFSsharedClient/prometheus-development/HTTPS"""
+                }
+                sh """cp -r  /mnt/dipNFSsharedClient/prometheus-development/TargetTemplate2.0.json $filename"""
+                def targetjson = readYaml file: """$filename"""
+                def target = targetjson[0].targets
+                targetjson[0].labels.application = props['deploy.app']
+                targetjson[0].labels.__metrics_path__ = "/actuator/prometheus"
+                target.add(targetvalue)
+                fileOperations([fileDeleteOperation(excludes: '', includes: filename)])
+                writeYaml file: filename, data: targetjson
+                sh """rm -rf sample.json"""
+            }
+        }
+        catch (e) {
+            currentBuild.result = 'FAILURE'
+            echo """${e.getMessage()}"""
+            throw e
+        }
+    }
+
+    stage('grafana trigger') {
+    def grafanaSecrets = [
+                [path: "environments/${props['deploy.defaultEnvironment']}", engineVersion: 2, secretValues: [
+                        [vaultKey: 'grafanaApiKey'], [vaultKey: 'server.grafana', envVar: 'serverGrafana']]]
+        ]
+        withVault([vaultSecrets: grafanaSecrets]) {
+            try {
+                if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+                    if (props['PostGrafana'] == 'true') {
+                        def grafanajson = readJSON file: """devops/monitoring/grafanadashboard.json"""
+                        def title_name = grafanajson.dashboard.title
+                        sh """
+                            sudo find . -type f -print0 | xargs -0 dos2unix
+                            chmod +x devops/monitoring/postgrafanadashboard.sh
+                            ./devops/monitoring/postgrafanadashboard.sh "http://${serverGrafana}" ${grafanaApiKey} ${grafanaDashboardUpload} ${title_name}
+                        """
+                    } else {
+                        echo "Developer Dont Want to Push Json to Grafana"
+                    }
+                }
+            }
+            catch (e) {
+                currentBuild.result = 'FAILURE'
+                echo """${e.getMessage()}"""
+                throw e
+            }
+        }
+    }
+
+
+}
